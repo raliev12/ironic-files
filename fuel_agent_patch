@@ -1,0 +1,1272 @@
+diff --git a/ironic/api/config.py b/ironic/api/config.py
+index 38938c1..0321306 100644
+--- a/ironic/api/config.py
++++ b/ironic/api/config.py
+@@ -30,8 +30,14 @@ app = {
+     'acl_public_routes': [
+         '/',
+         '/v1',
++        # IPA ramdisk methods
+         '/v1/drivers/[a-z_]*/vendor_passthru/lookup',
+-        '/v1/nodes/[a-z0-9\-]+/vendor_passthru/heartbeat'
++        '/v1/nodes/[a-z0-9\-]+/vendor_passthru/heartbeat',
++        # DIB ramdisk methods
++        # NOTE(yuriyz): support URL without 'v1' for backward compatibility
++        # with old DIB ramdisks.
++        '(?:/v1)?/nodes/[a-z0-9\-]+/vendor_passthru/pass_(?:deploy|'
++        'bootloader_install)_info',
+     ],
+ }
+ 
+diff --git a/ironic/common/image_service.py b/ironic/common/image_service.py
+index e4bef4a..6020f27 100644
+--- a/ironic/common/image_service.py
++++ b/ironic/common/image_service.py
+@@ -28,6 +28,7 @@ import six.moves.urllib.parse as urlparse
+ 
+ from ironic.common import exception
+ from ironic.common.i18n import _
++from ironic.common import keystone
+ from ironic.openstack.common import log as logging
+ 
+ LOG = logging.getLogger(__name__)
+@@ -83,6 +84,9 @@ def import_versioned_module(version, submodule=None):
+ def GlanceImageService(client=None, version=1, context=None):
+     module = import_versioned_module(version, 'image_service')
+     service_class = getattr(module, 'GlanceImageService')
++    if (context is not None and CONF.glance.auth_strategy == 'keystone'
++        and not context.auth_token):
++        context.auth_token = keystone.get_admin_auth_token()
+     return service_class(client, version, context)
+ 
+ 
+diff --git a/ironic/conductor/manager.py b/ironic/conductor/manager.py
+index c2b75bc..1617d30 100644
+--- a/ironic/conductor/manager.py
++++ b/ironic/conductor/manager.py
+@@ -52,7 +52,6 @@ from eventlet import greenpool
+ from oslo import messaging
+ from oslo_concurrency import lockutils
+ from oslo_config import cfg
+-from oslo_context import context as ironic_context
+ from oslo_db import exception as db_exception
+ from oslo_utils import excutils
+ from oslo_utils import uuidutils
+@@ -68,7 +67,6 @@ from ironic.common.i18n import _LE
+ from ironic.common.i18n import _LI
+ from ironic.common.i18n import _LW
+ from ironic.common import images
+-from ironic.common import keystone
+ from ironic.common import rpc
+ from ironic.common import states
+ from ironic.common import swift
+@@ -1134,22 +1132,14 @@ class ConductorManager(periodic_task.PeriodicTasks):
+         node_iter = self.iter_nodes(fields=['id', 'conductor_affinity'],
+                                     filters=filters)
+ 
+-        admin_context = None
+         workers_count = 0
+         for node_uuid, driver, node_id, conductor_affinity in node_iter:
+             if conductor_affinity == self.conductor.id:
+                 continue
+ 
+-            # NOTE(lucasagomes): The context provided by the periodic task
+-            # will make the glance client to fail with an 401 (Unauthorized)
+-            # so we have to use the admin_context with an admin auth_token
+-            if not admin_context:
+-                admin_context = ironic_context.get_admin_context()
+-                admin_context.auth_token = keystone.get_admin_auth_token()
+-
+             # Node is mapped here, but not updated by this conductor last
+             try:
+-                with task_manager.acquire(admin_context, node_uuid) as task:
++                with task_manager.acquire(context, node_uuid) as task:
+                     # NOTE(deva): now that we have the lock, check again to
+                     # avoid racing with deletes and other state changes
+                     node = task.node
+diff --git a/ironic/drivers/fuel.py b/ironic/drivers/fuel.py
+new file mode 100644
+index 0000000..0f66120
+--- /dev/null
++++ b/ironic/drivers/fuel.py
+@@ -0,0 +1,55 @@
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from ironic.drivers import base
++from ironic.drivers.modules import fuel_agent
++from ironic.drivers.modules import ipmitool
++from ironic.drivers.modules import ssh
++
++
++class FuelAndIPMIToolDriver(base.BaseDriver):
++    """Fuel + IPMITool driver.
++
++    This driver implements the `core` functionality, combining
++    :class:`ironic.drivers.modules.ipmitool.IPMIPower` (for power on/off and
++    reboot) with :class:`ironic.drivers.modules.fuel_agent.FuelAgentDeploy`
++    (for image deployment).
++    Implementations are in those respective classes; this class is merely the
++    glue between them.
++    """
++
++    def __init__(self):
++        self.power = ipmitool.IPMIPower()
++        self.deploy = fuel_agent.FuelAgentDeploy()
++        self.management = ipmitool.IPMIManagement()
++        self.console = ipmitool.IPMIShellinaboxConsole()
++        self.vendor = fuel_agent.FuelAgentVendor()
++
++
++class FuelAndSSHDriver(base.BaseDriver):
++    """Fuel + SSH driver.
++
++    NOTE: This driver is meant only for testing environments.
++
++    This driver implements the `core` functionality, combining
++    :class:`ironic.drivers.modules.ssh.SSH` (for power on/off and reboot of
++    virtual machines tunneled over SSH), with
++    :class:`ironic.drivers.modules.fuel_agent.FuelAgentDeploy` (for image
++    deployment). Implementations are in those respective classes; this class
++    is merely the glue between them.
++    """
++
++    def __init__(self):
++        self.power = ssh.SSHPower()
++        self.deploy = fuel_agent.FuelAgentDeploy()
++        self.management = ssh.SSHManagement()
++        self.vendor = fuel_agent.FuelAgentVendor()
+diff --git a/ironic/drivers/modules/fuel_agent.py b/ironic/drivers/modules/fuel_agent.py
+new file mode 100644
+index 0000000..ea0b353
+--- /dev/null
++++ b/ironic/drivers/modules/fuel_agent.py
+@@ -0,0 +1,423 @@
++#
++# Licensed under the Apache License, Version 2.0 (the "License"); you may
++# not use this file except in compliance with the License. You may obtain
++# a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++# License for the specific language governing permissions and limitations
++# under the License.
++
++"""
++Fuel Agent deploy driver.
++"""
++
++import json
++import os
++import tempfile
++
++from oslo_concurrency import processutils
++from oslo_config import cfg
++from oslo_utils import excutils
++
++from ironic.common import boot_devices
++from ironic.common import dhcp_factory
++from ironic.common import exception
++from ironic.common.glance_service import service_utils
++from ironic.common.i18n import _
++from ironic.common.i18n import _LE
++from ironic.common.i18n import _LI
++from ironic.common import image_service
++from ironic.common import keystone
++from ironic.common import paths
++from ironic.common import pxe_utils
++from ironic.common import states
++from ironic.common import utils
++from ironic.conductor import task_manager
++from ironic.conductor import utils as manager_utils
++from ironic.drivers import base
++from ironic.drivers.modules import deploy_utils
++from ironic.drivers.modules import image_cache
++from ironic.openstack.common import fileutils
++from ironic.openstack.common import log
++
++agent_opts = [
++    cfg.StrOpt('pxe_config_template',
++               default=paths.basedir_def(
++                   'drivers/modules/fuel_config.template'),
++               help='Template file for PXE configuration.'), ]
++
++CONF = cfg.CONF
++CONF.register_opts(agent_opts, group='fuel')
++
++LOG = log.getLogger(__name__)
++
++REQUIRED_PROPERTIES = {
++    'deploy_kernel': _('UUID (from Glance) of the deployment kernel. '
++                       'Required.'),
++    'deploy_ramdisk': _('UUID (from Glance) of the ramdisk that is '
++                        'mounted at boot time. Required.'),
++}
++OTHER_PROPERTIES = {
++    'fuel_username': _('SSH username; default is "admin" Optional.'),
++    'fuel_key_filename': _('Name of SSH private key file; default is '
++                           '"/etc/ironic/fuel_key". Optional.'),
++    'fuel_ssh_port': _('SSH port; default is 22. Optional.'),
++    'fuel_deploy_script': _('path to Fuel Agent executable entry point; '
++                            'default is "provision_mos" Optional.'),
++}
++COMMON_PROPERTIES = REQUIRED_PROPERTIES.copy()
++COMMON_PROPERTIES.update(OTHER_PROPERTIES)
++
++
++def _parse_driver_info(node):
++    """Gets the information needed for accessing the node.
++
++    :param node: the Node object.
++    :returns: dictionary of information.
++    :raises: InvalidParameterValue if any required parameters are incorrect.
++    :raises: MissingParameterValue if any required parameters are missing.
++
++    """
++    info = node.driver_info
++    d_info = {}
++    error_msgs = []
++
++    params = {param: info.get(param) for param in REQUIRED_PROPERTIES}
++    msg = _('Node %s failed to validate deploy image info. Some '
++            'parameters were missing') % node.uuid
++    deploy_utils.check_for_missing_params(params, msg)
++
++    d_info['username'] = info.get('fuel_username', 'admin')
++    d_info['key_filename'] = info.get('fuel_key_filename',
++                                      '/etc/ironic/fuel_key')
++
++    if not os.path.isfile(d_info['key_filename']):
++        error_msgs.append(_("SSH key file %s not found.") %
++                          d_info['key_filename'])
++
++    try:
++        d_info['port'] = int(info.get('fuel_ssh_port', 22))
++    except ValueError:
++        error_msgs.append(_("'fuel_ssh_port' must be an integer."))
++
++    if error_msgs:
++        msg = (_('The following errors were encountered while parsing '
++                 'driver_info:\n%s') % '\n'.join(error_msgs))
++        raise exception.InvalidParameterValue(msg)
++
++    d_info['script'] = info.get('fuel_deploy_script', 'provision_mos')
++
++    return d_info
++
++
++def _get_tftp_image_info(node):
++    return pxe_utils.get_deploy_kr_info(node.uuid, node.driver_info)
++
++
++def _get_deploy_data(context, image_source):
++    glance = image_service.GlanceImageService(version=2, context=context)
++    image_props = glance.show(image_source).get('properties', {})
++    LOG.debug('Image %s properties are: %s', image_source, image_props)
++    try:
++        data = json.loads(image_props['mos_disk_info'])
++    except KeyError:
++        raise exception.MissingParameterValue(_('Image %s does not contain '
++                                              'disk layout data.') %
++                                              image_source)
++    except ValueError:
++        raise exception.InvalidParameterValue(_('Invalid disk layout data for '
++                                                'image %s') % image_source)
++    return data
++
++
++@image_cache.cleanup(priority=25)
++class AgentTFTPImageCache(image_cache.ImageCache):
++    def __init__(self, image_service=None):
++        super(AgentTFTPImageCache, self).__init__(
++            CONF.pxe.tftp_master_path,
++            # MiB -> B
++            CONF.pxe.image_cache_size * 1024 * 1024,
++            # min -> sec
++            CONF.pxe.image_cache_ttl * 60,
++            image_service=image_service)
++
++
++def _cache_tftp_images(ctx, node, pxe_info):
++    """Fetch the necessary kernels and ramdisks for the instance."""
++    fileutils.ensure_tree(
++        os.path.join(CONF.pxe.tftp_root, node.uuid))
++    LOG.debug("Fetching kernel and ramdisk for node %s",
++              node.uuid)
++    deploy_utils.fetch_images(ctx, AgentTFTPImageCache(), pxe_info.values())
++
++
++def build_instance_info_for_deploy(task):
++    """Build instance_info necessary for deploying to a node.
++
++    :param task: a TaskManager object containing the node
++    :returns: a dictionary containing the properties to be updated
++        in instance_info
++    :raises: exception.ImageRefValidationFailed if image_source is not
++        Glance href and is not HTTP(S) URL.
++    """
++    node = task.node
++    instance_info = node.instance_info
++
++    image_source = instance_info['image_source']
++    if service_utils.is_glance_image(image_source):
++        glance = image_service.GlanceImageService(version=2,
++                                                  context=task.context)
++        image_info = glance.show(image_source)
++        swift_temp_url = glance.swift_temp_url(image_info)
++        LOG.debug('Got image info: %(info)s for node %(node)s.',
++                  {'info': image_info, 'node': node.uuid})
++        instance_info['image_url'] = swift_temp_url
++        instance_info['image_checksum'] = image_info['checksum']
++        instance_info['image_disk_format'] = image_info['disk_format']
++        instance_info['image_container_format'] = (
++            image_info['container_format'])
++    else:
++        try:
++            image_service.HttpImageService().validate_href(image_source)
++        except exception.ImageRefValidationFailed:
++            with excutils.save_and_reraise_exception():
++                LOG.error(_LE("Agent deploy supports only HTTP(S) URLs as "
++                              "instance_info['image_source']. Either %s "
++                              "is not a valid HTTP(S) URL or "
++                              "is not reachable."), image_source)
++        instance_info['image_url'] = image_source
++
++    return instance_info
++
++
++def _build_pxe_config_options(node, pxe_info):
++    """Builds the pxe config options for booting agent.
++
++    This method builds the config options to be replaced on
++    the agent pxe config template.
++
++    :param node: an ironic node object
++    :param pxe_info: A dict containing the 'deploy_kernel' and
++        'deploy_ramdisk' for the agent pxe config template.
++    :returns: a dict containing the options to be applied on
++    the agent pxe config template.
++    """
++    ironic_api = (CONF.conductor.api_url or
++                  keystone.get_service_url()).rstrip('/')
++
++    agent_config_opts = {
++        'deployment_aki_path': pxe_info['deploy_kernel'][1],
++        'deployment_ari_path': pxe_info['deploy_ramdisk'][1],
++        'deployment_id': node.uuid,
++        'api-url': ironic_api,
++    }
++
++    return agent_config_opts
++
++
++def _prepare_pxe_boot(task):
++    """Prepare the files required for PXE booting the agent."""
++    pxe_info = _get_tftp_image_info(task.node)
++    pxe_options = _build_pxe_config_options(task.node, pxe_info)
++    pxe_utils.create_pxe_config(task,
++                                pxe_options,
++                                CONF.fuel.pxe_config_template)
++    _cache_tftp_images(task.context, task.node, pxe_info)
++
++
++def _do_pxe_boot(task, ports=None):
++    """Reboot the node into the PXE ramdisk.
++
++    :param task: a TaskManager instance
++    :param ports: a list of Neutron port dicts to update DHCP options on. If
++        None, will get the list of ports from the Ironic port objects.
++    """
++    dhcp_opts = pxe_utils.dhcp_options_for_instance(task)
++    provider = dhcp_factory.DHCPFactory()
++    provider.update_dhcp(task, dhcp_opts, ports)
++    manager_utils.node_set_boot_device(task, boot_devices.PXE, persistent=True)
++    manager_utils.node_power_action(task, states.REBOOT)
++
++
++def _clean_up_pxe(task):
++    """Clean up left over PXE and DHCP files."""
++    pxe_info = _get_tftp_image_info(task.node)
++    for label in pxe_info:
++        path = pxe_info[label][1]
++        utils.unlink_without_raise(path)
++    AgentTFTPImageCache().clean_up()
++    pxe_utils.clean_up_pxe_config(task)
++
++
++def _sftp_upload(sftp, data, path):
++    with tempfile.NamedTemporaryFile(dir=CONF.tempdir) as f:
++        f.write(data)
++        f.flush()
++        sftp.put(f.name, path)
++
++
++class FuelAgentDeploy(base.DeployInterface):
++    """Interface for deploy-related actions."""
++
++    def get_properties(self):
++        """Return the properties of the interface.
++
++        :returns: dictionary of <property name>:<property description> entries.
++        """
++        return COMMON_PROPERTIES
++
++    def validate(self, task):
++        """Validate the driver-specific Node deployment info.
++
++        This method validates whether the properties of the supplied node
++        contain the required information for this driver to deploy images to
++        the node.
++
++        :param task: a TaskManager instance
++        :raises: MissingParameterValue
++        """
++        _parse_driver_info(task.node)
++
++    @task_manager.require_exclusive_lock
++    def deploy(self, task):
++        """Perform a deployment to a node.
++
++        Perform the necessary work to deploy an image onto the specified node.
++        This method will be called after prepare(), which may have already
++        performed any preparatory steps, such as pre-caching some data for the
++        node.
++
++        :param task: a TaskManager instance.
++        :returns: status of the deploy. One of ironic.common.states.
++        """
++        _do_pxe_boot(task)
++        return states.DEPLOYWAIT
++
++    @task_manager.require_exclusive_lock
++    def tear_down(self, task):
++        """Tear down a previous deployment on the task's node.
++
++        :param task: a TaskManager instance.
++        :returns: status of the deploy. One of ironic.common.states.
++        """
++        manager_utils.node_power_action(task, states.POWER_OFF)
++        return states.DELETED
++
++    def prepare(self, task):
++        """Prepare the deployment environment for this node.
++
++        :param task: a TaskManager instance.
++        """
++        node = task.node
++        _prepare_pxe_boot(task)
++
++        node.instance_info = build_instance_info_for_deploy(task)
++        node.save()
++
++    def clean_up(self, task):
++        """Clean up the deployment environment for this node.
++
++        If preparation of the deployment environment ahead of time is possible,
++        this method should be implemented by the driver. It should erase
++        anything cached by the `prepare` method.
++
++        If implemented, this method must be idempotent. It may be called
++        multiple times for the same node on the same conductor, and it may be
++        called by multiple conductors in parallel. Therefore, it must not
++        require an exclusive lock.
++
++        This method is called before `tear_down`.
++
++        :param task: a TaskManager instance.
++        """
++        _clean_up_pxe(task)
++
++    def take_over(self, task):
++        pass
++
++
++class FuelAgentVendor(base.VendorInterface):
++
++    def get_properties(self):
++        """Return the properties of the interface.
++
++        :returns: dictionary of <property name>:<property description> entries.
++        """
++        return COMMON_PROPERTIES
++
++    def validate(self, task, method, **kwargs):
++        """Validate the driver-specific Node deployment info.
++
++        :param task: a TaskManager instance
++        :param method: method to be validated
++        """
++        _parse_driver_info(task.node)
++        if not kwargs.get('status'):
++            raise exception.MissingParameterValue(_('Unknown Fuel Agent status'
++                                                    ' on a node.'))
++        if not kwargs.get('address'):
++            raise exception.MissingParameterValue(_('Fuel Agent must pass '
++                                                    'address of a node.'))
++
++    @base.passthru(['POST'])
++    @task_manager.require_exclusive_lock
++    def pass_deploy_info(self, task, **kwargs):
++        """Continues the deployment of baremetal node."""
++
++        node = task.node
++        task.process_event('resume')
++        err_msg = _('Failed to continue deployment with Fuel Agent.')
++
++        agent_status = kwargs.get('status')
++        if agent_status != 'ready':
++            LOG.error(_LE('Deploy failed for node %(node)s. Fuel Agent is not '
++                      'in ready state, error: %(error)s'), {'node': node.uuid,
++                      'error': kwargs.get('error_message')})
++            deploy_utils.set_failed_state(task, err_msg)
++            return
++
++        params = _parse_driver_info(node)
++        params['host'] = kwargs.get('address')
++        cmd = '%s --data_driver ironic' % params.pop('script')
++        instance_info = node.instance_info
++
++        try:
++            deploy_data = _get_deploy_data(task.context,
++                                           instance_info['image_source'])
++
++            image_data = {"/": {"uri": instance_info['image_url'],
++                                "format": "raw",
++                                "container": "raw"}}
++
++            deploy_data['ks_meta']['image_data'] = image_data
++
++            ssh = utils.ssh_connect(params)
++            sftp = ssh.open_sftp()
++            # TODO(yuriyz) no hardcode
++            _sftp_upload(sftp, json.dumps(deploy_data), '/tmp/provision.json')
++
++            # swift configdrive store should be disabled
++            configdrive = instance_info.get('configdrive')
++            if configdrive is not None:
++                # TODO(yuriyz) no hardcode
++                _sftp_upload(sftp, configdrive, '/tmp/config-drive.img')
++
++            out, err = processutils.ssh_execute(ssh, cmd)
++            LOG.info(_LI('Fuel Agent pass on node %s'), node.uuid)
++            LOG.debug('Fuel Agent stdout is: "%s"', out)
++            LOG.debug('Fuel Agent stderr is: "%s"', err)
++            manager_utils.node_set_boot_device(task, boot_devices.DISK,
++                                               persistent=True)
++            manager_utils.node_power_action(task, states.REBOOT)
++        except Exception as e:
++            msg = (_('Deploy failed for node %(node)s. Error: %(error)s') %
++                   {'node': node.uuid, 'error': e})
++            LOG.error(msg)
++            deploy_utils.set_failed_state(task, msg)
++        else:
++            task.process_event('done')
++            LOG.info(_LI('Deployment to node %s done'), task.node.uuid)
+diff --git a/ironic/drivers/modules/fuel_config.template b/ironic/drivers/modules/fuel_config.template
+new file mode 100644
+index 0000000..4d09aec
+--- /dev/null
++++ b/ironic/drivers/modules/fuel_config.template
+@@ -0,0 +1,6 @@
++default deploy
++
++label deploy
++kernel {{ pxe_options.deployment_aki_path }}
++append initrd={{ pxe_options.deployment_ari_path }} text deployment_id={{ pxe_options.deployment_id }} api-url={{ pxe_options['api-url'] }}
++
+diff --git a/ironic/drivers/modules/ilo/deploy.py b/ironic/drivers/modules/ilo/deploy.py
+index 86dc0c7..1791608 100644
+--- a/ironic/drivers/modules/ilo/deploy.py
++++ b/ironic/drivers/modules/ilo/deploy.py
+@@ -30,7 +30,6 @@ from ironic.common.i18n import _LI
+ from ironic.common.i18n import _LW
+ from ironic.common import image_service
+ from ironic.common import images
+-from ironic.common import keystone
+ from ironic.common import states
+ from ironic.common import swift
+ from ironic.conductor import task_manager
+@@ -868,9 +867,6 @@ class VendorPassthru(agent_base_vendor.BaseAgentVendor):
+                 task, root_uuid=root_uuid,
+                 efi_system_part_uuid=efi_system_part_uuid)
+         else:
+-            # Agent vendorpassthru are made without auth token.
+-            # We require auth_token to talk to glance while building boot iso.
+-            task.context.auth_token = keystone.get_admin_auth_token()
+             self._configure_vmedia_boot(task, root_uuid)
+ 
+         # Set boot mode
+diff --git a/ironic/drivers/modules/pxe.py b/ironic/drivers/modules/pxe.py
+index 9ab3fc3..3761a3f 100644
+--- a/ironic/drivers/modules/pxe.py
++++ b/ironic/drivers/modules/pxe.py
+@@ -30,7 +30,6 @@ from ironic.common.i18n import _
+ from ironic.common.i18n import _LE
+ from ironic.common.i18n import _LW
+ from ironic.common import image_service as service
+-from ironic.common import keystone
+ from ironic.common import paths
+ from ironic.common import pxe_utils
+ from ironic.common import states
+@@ -227,11 +226,6 @@ def _build_pxe_config_options(node, pxe_info, ctx):
+     return pxe_options
+ 
+ 
+-def _get_token_file_path(node_uuid):
+-    """Generate the path for PKI token file."""
+-    return os.path.join(CONF.pxe.tftp_root, 'token-' + node_uuid)
+-
+-
+ def validate_boot_option_for_uefi(node):
+     """In uefi boot mode, validate if the boot option is compatible.
+ 
+@@ -315,25 +309,6 @@ def _get_image_info(node, ctx):
+     return image_info
+ 
+ 
+-def _create_token_file(task):
+-    """Save PKI token to file."""
+-    token_file_path = _get_token_file_path(task.node.uuid)
+-    token = task.context.auth_token
+-    if token:
+-        timeout = CONF.conductor.deploy_callback_timeout
+-        if timeout and keystone.token_expires_soon(token, timeout):
+-            token = keystone.get_admin_auth_token()
+-        utils.write_to_file(token_file_path, token)
+-    else:
+-        utils.unlink_without_raise(token_file_path)
+-
+-
+-def _destroy_token_file(node):
+-    """Delete PKI token file."""
+-    token_file_path = _get_token_file_path(node['uuid'])
+-    utils.unlink_without_raise(token_file_path)
+-
+-
+ class PXEDeploy(base.DeployInterface):
+     """PXE Deploy Interface for deploy-related actions."""
+ 
+@@ -390,9 +365,8 @@ class PXEDeploy(base.DeployInterface):
+     def deploy(self, task):
+         """Start deployment of the task's node'.
+ 
+-        Fetches instance image, creates a temporary keystone token file,
+-        updates the DHCP port options for next boot, and issues a reboot
+-        request to the power driver.
++        Fetches instance image, updates the DHCP port options for next boot,
++        and issues a reboot request to the power driver.
+         This causes the node to boot into the deployment ramdisk and triggers
+         the next phase of PXE-based deployment via
+         VendorPassthru.pass_deploy_info().
+@@ -403,9 +377,6 @@ class PXEDeploy(base.DeployInterface):
+         iscsi_deploy.cache_instance_image(task.context, task.node)
+         iscsi_deploy.check_image_size(task)
+ 
+-        # TODO(yuriyz): more secure way needed for pass auth token
+-        #               to deploy ramdisk
+-        _create_token_file(task)
+         dhcp_opts = pxe_utils.dhcp_options_for_instance(task)
+         provider = dhcp_factory.DHCPFactory()
+         provider.update_dhcp(task, dhcp_opts)
+@@ -492,8 +463,7 @@ class PXEDeploy(base.DeployInterface):
+         """Clean up the deployment environment for the task's node.
+ 
+         Unlinks TFTP and instance images and triggers image cache cleanup.
+-        Removes the TFTP configuration files for this node. As a precaution,
+-        this method also ensures the keystone auth token file was removed.
++        Removes the TFTP configuration files for this node.
+ 
+         :param task: a TaskManager instance containing the node to act on.
+         """
+@@ -514,7 +484,6 @@ class PXEDeploy(base.DeployInterface):
+         pxe_utils.clean_up_pxe_config(task)
+ 
+         iscsi_deploy.destroy_images(node.uuid)
+-        _destroy_token_file(node)
+ 
+     def take_over(self, task):
+         if not iscsi_deploy.get_boot_option(task.node) == "local":
+@@ -593,7 +562,6 @@ class VendorPassthru(agent_base_vendor.BaseAgentVendor):
+         node = task.node
+         task.process_event('resume')
+ 
+-        _destroy_token_file(node)
+         is_whole_disk_image = node.driver_internal_info['is_whole_disk_image']
+         uuid_dict = iscsi_deploy.continue_deploy(task, **kwargs)
+         root_uuid_or_disk_id = uuid_dict.get(
+@@ -658,11 +626,6 @@ class VendorPassthru(agent_base_vendor.BaseAgentVendor):
+         node = task.node
+         LOG.debug('Continuing the deployment on node %s', node.uuid)
+ 
+-        # NOTE(lucasagomes): We don't use the token file with the agent,
+-        # but as it's created as part of deploy() we are going to remove
+-        # it here.
+-        _destroy_token_file(node)
+-
+         uuid_dict = iscsi_deploy.do_agent_iscsi_deploy(task, self._client)
+ 
+         is_whole_disk_image = node.driver_internal_info['is_whole_disk_image']
+diff --git a/ironic/tests/conductor/test_manager.py b/ironic/tests/conductor/test_manager.py
+index df00787..26fae29 100644
+--- a/ironic/tests/conductor/test_manager.py
++++ b/ironic/tests/conductor/test_manager.py
+@@ -24,7 +24,6 @@ import eventlet
+ import mock
+ from oslo import messaging
+ from oslo_config import cfg
+-from oslo_context import context
+ from oslo_db import exception as db_exception
+ from oslo_utils import strutils
+ from oslo_utils import uuidutils
+@@ -33,7 +32,6 @@ from ironic.common import boot_devices
+ from ironic.common import driver_factory
+ from ironic.common import exception
+ from ironic.common import images
+-from ironic.common import keystone
+ from ironic.common import states
+ from ironic.common import swift
+ from ironic.conductor import manager
+@@ -3360,7 +3358,6 @@ class ManagerTestProperties(tests_db_base.DbTestCase):
+         self.assertEqual(exception.DriverNotFound, exc.exc_info[0])
+ 
+ 
+-@mock.patch.object(keystone, 'get_admin_auth_token')
+ @mock.patch.object(task_manager, 'acquire')
+ @mock.patch.object(manager.ConductorManager, '_mapped_to_this_conductor')
+ @mock.patch.object(dbapi.IMPL, 'get_nodeinfo_list')
+@@ -3388,8 +3385,7 @@ class ManagerSyncLocalStateTestCase(_CommonMixIn, tests_db_base.DbTestCase):
+         get_nodeinfo_mock.assert_called_once_with(
+                 columns=self.columns, filters=self.filters)
+ 
+-    def test_not_mapped(self, get_nodeinfo_mock, mapped_mock, acquire_mock,
+-                        get_authtoken_mock):
++    def test_not_mapped(self, get_nodeinfo_mock, mapped_mock, acquire_mock):
+         get_nodeinfo_mock.return_value = self._get_nodeinfo_list_response()
+         mapped_mock.return_value = False
+ 
+@@ -3398,11 +3394,10 @@ class ManagerSyncLocalStateTestCase(_CommonMixIn, tests_db_base.DbTestCase):
+         self._assert_get_nodeinfo_args(get_nodeinfo_mock)
+         mapped_mock.assert_called_once_with(self.node.uuid, self.node.driver)
+         self.assertFalse(acquire_mock.called)
+-        self.assertFalse(get_authtoken_mock.called)
+         self.service.ring_manager.reset.assert_called_once_with()
+ 
+     def test_already_mapped(self, get_nodeinfo_mock, mapped_mock,
+-                             acquire_mock, get_authtoken_mock):
++                            acquire_mock):
+         # Node is already mapped to the conductor running the periodic task
+         self.node.conductor_affinity = 123
+         self.service.conductor.id = 123
+@@ -3415,13 +3410,9 @@ class ManagerSyncLocalStateTestCase(_CommonMixIn, tests_db_base.DbTestCase):
+         self._assert_get_nodeinfo_args(get_nodeinfo_mock)
+         mapped_mock.assert_called_once_with(self.node.uuid, self.node.driver)
+         self.assertFalse(acquire_mock.called)
+-        self.assertFalse(get_authtoken_mock.called)
+         self.service.ring_manager.reset.assert_called_once_with()
+ 
+-    @mock.patch.object(context, 'get_admin_context')
+-    def test_good(self, get_ctx_mock, get_nodeinfo_mock, mapped_mock,
+-                  acquire_mock, get_authtoken_mock):
+-        get_ctx_mock.return_value = self.context
++    def test_good(self, get_nodeinfo_mock, mapped_mock, acquire_mock):
+         get_nodeinfo_mock.return_value = self._get_nodeinfo_list_response()
+         mapped_mock.return_value = True
+         acquire_mock.side_effect = self._get_acquire_side_effect(self.task)
+@@ -3430,17 +3421,14 @@ class ManagerSyncLocalStateTestCase(_CommonMixIn, tests_db_base.DbTestCase):
+ 
+         self._assert_get_nodeinfo_args(get_nodeinfo_mock)
+         mapped_mock.assert_called_once_with(self.node.uuid, self.node.driver)
+-        get_authtoken_mock.assert_called_once_with()
+         acquire_mock.assert_called_once_with(self.context, self.node.uuid)
+         # assert spawn_after has been called
+         self.task.spawn_after.assert_called_once_with(
+                 self.service._spawn_worker,
+                 self.service._do_takeover, self.task)
+ 
+-    @mock.patch.object(context, 'get_admin_context')
+-    def test_no_free_worker(self, get_ctx_mock, get_nodeinfo_mock, mapped_mock,
+-                            acquire_mock, get_authtoken_mock):
+-        get_ctx_mock.return_value = self.context
++    def test_no_free_worker(self, get_nodeinfo_mock, mapped_mock,
++                            acquire_mock):
+         mapped_mock.return_value = True
+         acquire_mock.side_effect = self._get_acquire_side_effect(
+                                        [self.task] * 3)
+@@ -3468,18 +3456,12 @@ class ManagerSyncLocalStateTestCase(_CommonMixIn, tests_db_base.DbTestCase):
+         expected = [mock.call(self.context, self.node.uuid)] * 2
+         self.assertEqual(expected, acquire_mock.call_args_list)
+ 
+-        # Only one auth token needed for all runs
+-        get_authtoken_mock.assert_called_once_with()
+-
+         # assert spawn_after has been called twice
+         expected = [mock.call(self.service._spawn_worker,
+                     self.service._do_takeover, self.task)] * 2
+         self.assertEqual(expected, self.task.spawn_after.call_args_list)
+ 
+-    @mock.patch.object(context, 'get_admin_context')
+-    def test_node_locked(self, get_ctx_mock, get_nodeinfo_mock, mapped_mock,
+-                            acquire_mock, get_authtoken_mock):
+-        get_ctx_mock.return_value = self.context
++    def test_node_locked(self, get_nodeinfo_mock, mapped_mock, acquire_mock,):
+         mapped_mock.return_value = True
+         acquire_mock.side_effect = self._get_acquire_side_effect(
+                 [self.task, exception.NodeLocked('error'), self.task])
+@@ -3501,20 +3483,14 @@ class ManagerSyncLocalStateTestCase(_CommonMixIn, tests_db_base.DbTestCase):
+         expected = [mock.call(self.context, self.node.uuid)] * 3
+         self.assertEqual(expected, acquire_mock.call_args_list)
+ 
+-        # Only one auth token needed for all runs
+-        get_authtoken_mock.assert_called_once_with()
+-
+         # assert spawn_after has been called only 2 times
+         expected = [mock.call(self.service._spawn_worker,
+                     self.service._do_takeover, self.task)] * 2
+         self.assertEqual(expected, self.task.spawn_after.call_args_list)
+ 
+-    @mock.patch.object(context, 'get_admin_context')
+-    def test_worker_limit(self, get_ctx_mock, get_nodeinfo_mock, mapped_mock,
+-                          acquire_mock, get_authtoken_mock):
++    def test_worker_limit(self, get_nodeinfo_mock, mapped_mock, acquire_mock):
+         # Limit to only 1 worker
+         self.config(periodic_max_workers=1, group='conductor')
+-        get_ctx_mock.return_value = self.context
+         mapped_mock.return_value = True
+         acquire_mock.side_effect = self._get_acquire_side_effect(
+                                        [self.task] * 3)
+@@ -3535,9 +3511,6 @@ class ManagerSyncLocalStateTestCase(_CommonMixIn, tests_db_base.DbTestCase):
+         # assert acquire() gets called only once because of the worker limit
+         acquire_mock.assert_called_once_with(self.context, self.node.uuid)
+ 
+-        # Only one auth token needed for all runs
+-        get_authtoken_mock.assert_called_once_with()
+-
+         # assert spawn_after has been called
+         self.task.spawn_after.assert_called_once_with(
+                 self.service._spawn_worker,
+diff --git a/ironic/tests/drivers/ilo/test_deploy.py b/ironic/tests/drivers/ilo/test_deploy.py
+index f44e532..25173c1 100644
+--- a/ironic/tests/drivers/ilo/test_deploy.py
++++ b/ironic/tests/drivers/ilo/test_deploy.py
+@@ -25,7 +25,6 @@ from ironic.common import exception
+ from ironic.common.glance_service import service_utils
+ from ironic.common import image_service
+ from ironic.common import images
+-from ironic.common import keystone
+ from ironic.common import states
+ from ironic.common import swift
+ from ironic.conductor import task_manager
+@@ -950,9 +949,8 @@ class VendorPassthruTestCase(db_base.DbTestCase):
+     def test_pass_deploy_info_whole_disk_image(self):
+         self._test_pass_deploy_info_whole_disk_image()
+ 
+-    @mock.patch.object(ilo_deploy, '_update_secure_boot_mode')
+-    @mock.patch.object(ilo_common, 'update_boot_mode')
+-    @mock.patch.object(keystone, 'get_admin_auth_token')
++    @mock.patch.object(ilo_deploy, '_update_secure_boot_mode', autospec=True)
++    @mock.patch.object(ilo_common, 'update_boot_mode', autospec=True)
+     @mock.patch.object(agent_base_vendor.BaseAgentVendor,
+                        'reboot_and_finish_deploy')
+     @mock.patch.object(ilo_deploy.VendorPassthru, '_configure_vmedia_boot')
+@@ -962,7 +960,6 @@ class VendorPassthruTestCase(db_base.DbTestCase):
+                                      do_agent_iscsi_deploy_mock,
+                                      configure_vmedia_boot_mock,
+                                      reboot_and_finish_deploy_mock,
+-                                     keystone_mock,
+                                      boot_mode_cap_mock,
+                                      update_secure_boot_mock):
+         self.node.provision_state = states.DEPLOYWAIT
+@@ -970,7 +967,6 @@ class VendorPassthruTestCase(db_base.DbTestCase):
+         self.node.save()
+         do_agent_iscsi_deploy_mock.return_value = {
+             'root uuid': 'some-root-uuid'}
+-        keystone_mock.return_value = 'admin-token'
+         with task_manager.acquire(self.context, self.node.uuid,
+                                   shared=False) as task:
+             task.driver.vendor.continue_deploy(task)
+@@ -981,9 +977,8 @@ class VendorPassthruTestCase(db_base.DbTestCase):
+                 task, 'some-root-uuid')
+             boot_mode_cap_mock.assert_called_once_with(task)
+             update_secure_boot_mock.assert_called_once_with(task, True)
+-            reboot_and_finish_deploy_mock.assert_called_once_with(task)
+-            # Ensure that admin token is populated in task
+-            self.assertEqual('admin-token', task.context.auth_token)
++            reboot_and_finish_deploy_mock.assert_called_once_with(
++                mock.ANY, task)
+ 
+     @mock.patch.object(ilo_deploy, '_update_secure_boot_mode')
+     @mock.patch.object(ilo_common, 'update_boot_mode')
+diff --git a/ironic/tests/drivers/test_pxe.py b/ironic/tests/drivers/test_pxe.py
+index 0c6168c..953002a 100644
+--- a/ironic/tests/drivers/test_pxe.py
++++ b/ironic/tests/drivers/test_pxe.py
+@@ -150,6 +150,7 @@ class PXEPrivateMethodsTestCase(db_base.DbTestCase):
+                                        self.node.uuid,
+                                        'deploy_kernel'))}
+         show_mock.return_value = properties
++        self.context.auth_token = 'fake'
+         image_info = pxe._get_image_info(self.node, self.context)
+         show_mock.assert_called_once_with('glance://image_uuid',
+                                           method='get')
+@@ -365,12 +366,7 @@ class PXEPrivateMethodsTestCase(db_base.DbTestCase):
+                                                 self.context)
+         self.assertEqual(expected_options, options)
+ 
+-    def test_get_token_file_path(self):
+-        node_uuid = self.node.uuid
+-        self.assertEqual('/tftpboot/token-' + node_uuid,
+-                         pxe._get_token_file_path(node_uuid))
+-
+-    @mock.patch.object(deploy_utils, 'fetch_images')
++    @mock.patch.object(deploy_utils, 'fetch_images', autospec=True)
+     def test__cache_tftp_images_master_path(self, mock_fetch_image):
+         temp_dir = tempfile.mkdtemp()
+         self.config(tftp_root=temp_dir, group='pxe')
+@@ -465,7 +461,7 @@ class PXEDriverTestCase(db_base.DbTestCase):
+ 
+     def setUp(self):
+         super(PXEDriverTestCase, self).setUp()
+-        self.context.auth_token = '4562138218392831'
++        self.context.auth_token = 'fake'
+         self.temp_dir = tempfile.mkdtemp()
+         self.config(tftp_root=self.temp_dir, group='pxe')
+         self.temp_dir = tempfile.mkdtemp()
+@@ -483,11 +479,6 @@ class PXEDriverTestCase(db_base.DbTestCase):
+                                                node_id=self.node.id)
+         self.config(group='conductor', api_url='http://127.0.0.1:1234/')
+ 
+-    def _create_token_file(self):
+-        token_path = pxe._get_token_file_path(self.node.uuid)
+-        open(token_path, 'w').close()
+-        return token_path
+-
+     def test_get_properties(self):
+         expected = pxe.COMMON_PROPERTIES
+         with task_manager.acquire(self.context, self.node.uuid,
+@@ -804,20 +795,18 @@ class PXEDriverTestCase(db_base.DbTestCase):
+         self.node.save()
+         self._test_prepare_node_active()
+ 
+-    @mock.patch.object(keystone, 'token_expires_soon')
+-    @mock.patch.object(deploy_utils, 'get_image_mb')
+-    @mock.patch.object(iscsi_deploy, '_get_image_file_path')
+-    @mock.patch.object(iscsi_deploy, 'cache_instance_image')
+-    @mock.patch.object(dhcp_factory.DHCPFactory, 'update_dhcp')
+-    @mock.patch.object(manager_utils, 'node_power_action')
+-    @mock.patch.object(manager_utils, 'node_set_boot_device')
++    @mock.patch.object(deploy_utils, 'get_image_mb', autospec=True)
++    @mock.patch.object(iscsi_deploy, '_get_image_file_path', autospec=True)
++    @mock.patch.object(iscsi_deploy, 'cache_instance_image', autospec=True)
++    @mock.patch.object(dhcp_factory.DHCPFactory, 'update_dhcp', autospec=True)
++    @mock.patch.object(manager_utils, 'node_power_action', autospec=True)
++    @mock.patch.object(manager_utils, 'node_set_boot_device', autospec=True)
+     def test_deploy(self, mock_node_set_boot, mock_node_power_action,
+                     mock_update_dhcp, mock_cache_instance_image,
+-                    mock_get_image_file_path, mock_get_image_mb, mock_expire):
++                    mock_get_image_file_path, mock_get_image_mb):
+         fake_img_path = '/test/path/test.img'
+         mock_get_image_file_path.return_value = fake_img_path
+         mock_get_image_mb.return_value = 1
+-        mock_expire.return_value = False
+         self.config(deploy_callback_timeout=600, group='conductor')
+ 
+         with task_manager.acquire(self.context,
+@@ -829,49 +818,14 @@ class PXEDriverTestCase(db_base.DbTestCase):
+                 self.context, task.node)
+             mock_get_image_file_path.assert_called_once_with(task.node.uuid)
+             mock_get_image_mb.assert_called_once_with(fake_img_path)
+-            mock_update_dhcp.assert_called_once_with(task, dhcp_opts)
+-            mock_expire.assert_called_once_with(self.context.auth_token, 600)
++            mock_update_dhcp.assert_called_once_with(mock.ANY, task, dhcp_opts)
+             mock_node_set_boot.assert_called_once_with(task, 'pxe',
+                                                        persistent=True)
+             mock_node_power_action.assert_called_once_with(task, states.REBOOT)
+ 
+-            # ensure token file created
+-            t_path = pxe._get_token_file_path(self.node.uuid)
+-            token = open(t_path, 'r').read()
+-            self.assertEqual(self.context.auth_token, token)
+-
+-    @mock.patch.object(keystone, 'get_admin_auth_token')
+-    @mock.patch.object(keystone, 'token_expires_soon')
+-    @mock.patch.object(deploy_utils, 'get_image_mb')
+-    @mock.patch.object(iscsi_deploy, '_get_image_file_path')
+-    @mock.patch.object(iscsi_deploy, 'cache_instance_image')
+-    @mock.patch.object(dhcp_factory.DHCPFactory, 'update_dhcp')
+-    @mock.patch.object(manager_utils, 'node_power_action')
+-    @mock.patch.object(manager_utils, 'node_set_boot_device')
+-    def test_deploy_token_near_expiration(self, mock_node_set_boot,
+-                    mock_node_power_action, mock_update_dhcp,
+-                    mock_cache_instance_image, mock_get_image_file_path,
+-                    mock_get_image_mb, mock_expire, mock_admin_token):
+-        mock_get_image_mb.return_value = 1
+-        mock_expire.return_value = True
+-        new_token = 'new_admin_token'
+-        mock_admin_token.return_value = new_token
+-        self.config(deploy_callback_timeout=600, group='conductor')
+-
+-        with task_manager.acquire(self.context,
+-                                  self.node.uuid, shared=False) as task:
+-            task.driver.deploy.deploy(task)
+-
+-            mock_expire.assert_called_once_with(self.context.auth_token, 600)
+-            mock_admin_token.assert_called_once_with()
+-            # ensure token file created with new token
+-            t_path = pxe._get_token_file_path(self.node.uuid)
+-            token = open(t_path, 'r').read()
+-            self.assertEqual(new_token, token)
+-
+-    @mock.patch.object(deploy_utils, 'get_image_mb')
+-    @mock.patch.object(iscsi_deploy, '_get_image_file_path')
+-    @mock.patch.object(iscsi_deploy, 'cache_instance_image')
++    @mock.patch.object(deploy_utils, 'get_image_mb', autospec=True)
++    @mock.patch.object(iscsi_deploy, '_get_image_file_path', autospec=True)
++    @mock.patch.object(iscsi_deploy, 'cache_instance_image', autospec=True)
+     def test_deploy_image_too_large(self, mock_cache_instance_image,
+                                     mock_get_image_file_path,
+                                     mock_get_image_mb):
+@@ -936,8 +890,6 @@ class PXEDriverTestCase(db_base.DbTestCase):
+                                       mock_image_cache, mock_switch_config,
+                                       notify_mock, mock_node_boot_dev,
+                                       mock_clean_pxe):
+-        token_path = self._create_token_file()
+-
+         # set local boot
+         if is_localboot:
+             i_info = self.node.instance_info
+@@ -962,7 +914,6 @@ class PXEDriverTestCase(db_base.DbTestCase):
+         self.assertEqual(states.POWER_ON, self.node.power_state)
+         self.assertIn('root_uuid_or_disk_id', self.node.driver_internal_info)
+         self.assertIsNone(self.node.last_error)
+-        self.assertFalse(os.path.exists(token_path))
+         mock_image_cache.assert_called_once_with()
+         mock_image_cache.return_value.clean_up.assert_called_once_with()
+         pxe_config_path = pxe_utils.get_pxe_config_file_path(self.node.uuid)
+@@ -993,8 +944,6 @@ class PXEDriverTestCase(db_base.DbTestCase):
+                                                 notify_mock,
+                                                 mock_node_boot_dev,
+                                                 mock_clean_pxe):
+-        token_path = self._create_token_file()
+-
+         # set local boot
+         if is_localboot:
+             i_info = self.node.instance_info
+@@ -1020,7 +969,6 @@ class PXEDriverTestCase(db_base.DbTestCase):
+         self.node.refresh()
+         self.assertEqual(states.POWER_ON, self.node.power_state)
+         self.assertIsNone(self.node.last_error)
+-        self.assertFalse(os.path.exists(token_path))
+         mock_image_cache.assert_called_once_with()
+         mock_image_cache.return_value.clean_up.assert_called_once_with()
+         pxe_config_path = pxe_utils.get_pxe_config_file_path(self.node.uuid)
+@@ -1132,8 +1080,6 @@ class CleanUpTestCase(db_base.DbTestCase):
+                                                     task.context)
+             mock_pxe_clean.assert_called_once_with(task)
+             mock_unlink.assert_any_call('deploy_kernel')
+-            mock_unlink.assert_any_call(pxe._get_token_file_path(
+-                task.node.uuid))
+             mock_iscsi_clean.assert_called_once_with(task.node.uuid)
+         mock_cache.return_value.clean_up.assert_called_once_with()
+ 
+@@ -1147,8 +1093,6 @@ class CleanUpTestCase(db_base.DbTestCase):
+             mock_image_info.assert_called_once_with(task.node,
+                                                     task.context)
+             mock_pxe_clean.assert_called_once_with(task)
+-            mock_unlink.assert_called_once_with(pxe._get_token_file_path(
+-                task.node.uuid))
+             mock_iscsi_clean.assert_called_once_with(task.node.uuid)
+         mock_cache.return_value.clean_up.assert_called_once_with()
+ 
+@@ -1205,11 +1149,10 @@ class CleanUpFullFlowTestCase(db_base.DbTestCase):
+         self.image_path = iscsi_deploy._get_image_file_path(self.node.uuid)
+         self.config_path = pxe_utils.get_pxe_config_file_path(self.node.uuid)
+         self.mac_path = pxe_utils._get_pxe_mac_path(self.port.address)
+-        self.token_path = pxe._get_token_file_path(self.node.uuid)
+ 
+         # Create files
+         self.files = [self.config_path, self.master_kernel_path,
+-                      self.master_instance_path, self.token_path]
++                      self.master_instance_path]
+         for fname in self.files:
+             # NOTE(dtantsur): files with 0 size won't be cleaned up
+             with open(fname, 'w') as fp:
+@@ -1257,19 +1200,16 @@ class TestAgentVendorPassthru(db_base.DbTestCase):
+         self.task.context = self.context
+ 
+     @mock.patch.object(agent_base_vendor.BaseAgentVendor,
+-                       'reboot_and_finish_deploy')
+-    @mock.patch.object(deploy_utils, 'switch_pxe_config')
+-    @mock.patch.object(iscsi_deploy, 'do_agent_iscsi_deploy')
+-    @mock.patch.object(pxe, '_destroy_token_file')
+-    def test_continue_deploy_netboot(self, destroy_token_file_mock,
+-                                     do_agent_iscsi_deploy_mock,
++                       'reboot_and_finish_deploy', autospec=True)
++    @mock.patch.object(deploy_utils, 'switch_pxe_config', autospec=True)
++    @mock.patch.object(iscsi_deploy, 'do_agent_iscsi_deploy', autospec=True)
++    def test_continue_deploy_netboot(self, do_agent_iscsi_deploy_mock,
+                                      switch_pxe_config_mock,
+                                      reboot_and_finish_deploy_mock):
+ 
+         uuid_dict_returned = {'root uuid': 'some-root-uuid'}
+         do_agent_iscsi_deploy_mock.return_value = uuid_dict_returned
+         self.driver.vendor.continue_deploy(self.task)
+-        destroy_token_file_mock.assert_called_once_with(self.node)
+         do_agent_iscsi_deploy_mock.assert_called_once_with(
+             self.task, self.driver.vendor._client)
+         tftp_config = '/tftpboot/%s/config' % self.node.uuid
+@@ -1282,11 +1222,9 @@ class TestAgentVendorPassthru(db_base.DbTestCase):
+                        'reboot_and_finish_deploy')
+     @mock.patch.object(pxe_utils, 'clean_up_pxe_config')
+     @mock.patch.object(agent_base_vendor.BaseAgentVendor,
+-                       'configure_local_boot')
+-    @mock.patch.object(iscsi_deploy, 'do_agent_iscsi_deploy')
+-    @mock.patch.object(pxe, '_destroy_token_file')
+-    def test_continue_deploy_localboot(self, destroy_token_file_mock,
+-                                       do_agent_iscsi_deploy_mock,
++                       'configure_local_boot', autospec=True)
++    @mock.patch.object(iscsi_deploy, 'do_agent_iscsi_deploy', autospec=True)
++    def test_continue_deploy_localboot(self, do_agent_iscsi_deploy_mock,
+                                        configure_local_boot_mock,
+                                        clean_up_pxe_config_mock,
+                                        reboot_and_finish_deploy_mock):
+@@ -1298,7 +1236,6 @@ class TestAgentVendorPassthru(db_base.DbTestCase):
+         do_agent_iscsi_deploy_mock.return_value = uuid_dict_returned
+ 
+         self.driver.vendor.continue_deploy(self.task)
+-        destroy_token_file_mock.assert_called_once_with(self.node)
+         do_agent_iscsi_deploy_mock.assert_called_once_with(
+             self.task, self.driver.vendor._client)
+         configure_local_boot_mock.assert_called_once_with(
+@@ -1310,11 +1247,9 @@ class TestAgentVendorPassthru(db_base.DbTestCase):
+                        'reboot_and_finish_deploy')
+     @mock.patch.object(pxe_utils, 'clean_up_pxe_config')
+     @mock.patch.object(agent_base_vendor.BaseAgentVendor,
+-                       'configure_local_boot')
+-    @mock.patch.object(iscsi_deploy, 'do_agent_iscsi_deploy')
+-    @mock.patch.object(pxe, '_destroy_token_file')
+-    def test_continue_deploy_localboot_uefi(self, destroy_token_file_mock,
+-                                            do_agent_iscsi_deploy_mock,
++                       'configure_local_boot', autospec=True)
++    @mock.patch.object(iscsi_deploy, 'do_agent_iscsi_deploy', autospec=True)
++    def test_continue_deploy_localboot_uefi(self, do_agent_iscsi_deploy_mock,
+                                             configure_local_boot_mock,
+                                             clean_up_pxe_config_mock,
+                                             reboot_and_finish_deploy_mock):
+@@ -1327,7 +1262,6 @@ class TestAgentVendorPassthru(db_base.DbTestCase):
+         do_agent_iscsi_deploy_mock.return_value = uuid_dict_returned
+ 
+         self.driver.vendor.continue_deploy(self.task)
+-        destroy_token_file_mock.assert_called_once_with(self.node)
+         do_agent_iscsi_deploy_mock.assert_called_once_with(
+             self.task, self.driver.vendor._client)
+         configure_local_boot_mock.assert_called_once_with(
+diff --git a/ironic/tests/test_glance_service.py b/ironic/tests/test_glance_service.py
+index 6c3276d..0ca4fa3 100644
+--- a/ironic/tests/test_glance_service.py
++++ b/ironic/tests/test_glance_service.py
+@@ -647,6 +647,7 @@ class TestGlanceSwiftTempURL(base.TestCase):
+         super(TestGlanceSwiftTempURL, self).setUp()
+         client = stubs.StubGlanceClient()
+         self.context = context.RequestContext()
++        self.context.auth_token = 'fake'
+         self.service = service.GlanceImageService(client, 2, self.context)
+         self.config(swift_temp_url_key='correcthorsebatterystaple',
+                     group='glance')
+diff --git a/ironic/tests/test_image_service.py b/ironic/tests/test_image_service.py
+index a5974d6..e0ca125 100644
+--- a/ironic/tests/test_image_service.py
++++ b/ironic/tests/test_image_service.py
+@@ -21,6 +21,7 @@ import six.moves.builtins as __builtin__
+ from ironic.common import exception
+ from ironic.common.glance_service.v1 import image_service as glance_v1_service
+ from ironic.common import image_service
++from ironic.common import keystone
+ from ironic.tests import base
+ 
+ 
+@@ -220,21 +221,57 @@ class FileImageServiceTestCase(base.TestCase):
+ 
+ class ServiceGetterTestCase(base.TestCase):
+ 
++    @mock.patch.object(keystone, 'get_admin_auth_token', autospec=True)
+     @mock.patch.object(glance_v1_service.GlanceImageService, '__init__',
+                        return_value=None, autospec=True)
+-    def test_get_glance_image_service(self, glance_service_mock):
++    def test_get_glance_image_service(self, glance_service_mock, token_mock):
+         image_href = 'image-uuid'
++        self.context.auth_token = 'fake'
+         image_service.get_image_service(image_href, context=self.context)
+         glance_service_mock.assert_called_once_with(mock.ANY, None, 1,
+                                                     self.context)
++        self.assertFalse(token_mock.called)
+ 
++    @mock.patch.object(keystone, 'get_admin_auth_token', autospec=True)
+     @mock.patch.object(glance_v1_service.GlanceImageService, '__init__',
+                        return_value=None, autospec=True)
+-    def test_get_glance_image_service_url(self, glance_service_mock):
++    def test_get_glance_image_service_url(self, glance_service_mock,
++                                          token_mock):
+         image_href = 'glance://image-uuid'
++        self.context.auth_token = 'fake'
+         image_service.get_image_service(image_href, context=self.context)
+         glance_service_mock.assert_called_once_with(mock.ANY, None, 1,
+                                                     self.context)
++        self.assertFalse(token_mock.called)
++
++    @mock.patch.object(keystone, 'get_admin_auth_token', autospec=True)
++    @mock.patch.object(glance_v1_service.GlanceImageService, '__init__',
++                       return_value=None, autospec=True)
++    def test_get_glance_image_service_no_token(self, glance_service_mock,
++                                               token_mock):
++        image_href = 'image-uuid'
++        self.context.auth_token = None
++        token_mock.return_value = 'admin-token'
++        image_service.get_image_service(image_href, context=self.context)
++        glance_service_mock.assert_called_once_with(mock.ANY, None, 1,
++                                                    self.context)
++        token_mock.assert_called_once_with()
++        self.assertEqual('admin-token', self.context.auth_token)
++
++    @mock.patch.object(keystone, 'get_admin_auth_token', autospec=True)
++    @mock.patch.object(glance_v1_service.GlanceImageService, '__init__',
++                       return_value=None, autospec=True)
++    def test_get_glance_image_service_token_not_needed(self,
++                                                       glance_service_mock,
++                                                       token_mock):
++        image_href = 'image-uuid'
++        self.context.auth_token = None
++        self.config(auth_strategy='noauth', group='glance')
++        image_service.get_image_service(image_href, context=self.context)
++        glance_service_mock.assert_called_once_with(mock.ANY, None, 1,
++                                                    self.context)
++        self.assertFalse(token_mock.called)
++        self.assertIsNone(self.context.auth_token)
+ 
+     @mock.patch.object(image_service.HttpImageService, '__init__',
+                        return_value=None, autospec=True)
+diff --git a/setup.cfg b/setup.cfg
+index d6bb07f..debb15f 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -53,6 +53,8 @@ ironic.drivers =
+     fake_irmc = ironic.drivers.fake:FakeIRMCDriver
+     fake_vbox = ironic.drivers.fake:FakeVirtualBoxDriver
+     fake_amt = ironic.drivers.fake:FakeAMTDriver
++    fuel_ipmitool = ironic.drivers.fuel:FuelAndIPMIToolDriver
++    fuel_ssh = ironic.drivers.fuel:FuelAndSSHDriver
+     iscsi_ilo = ironic.drivers.ilo:IloVirtualMediaIscsiDriver
+     pxe_ipmitool = ironic.drivers.pxe:PXEAndIPMIToolDriver
+     pxe_ipminative = ironic.drivers.pxe:PXEAndIPMINativeDriver
+
