@@ -1,0 +1,1 @@
+KERNEL=="vd?*", PROGRAM="/bin/vd-sd %k %n", SYMLINK+="%c"
