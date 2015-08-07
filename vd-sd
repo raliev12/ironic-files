@@ -1,0 +1,10 @@
+#!/bin/bash
+if [ $# -ne 1 ]
+then
+    argdev=${1%%$2}
+else
+    argdev=$1
+fi
+reqdev=`/sbin/udevadm  info -q path -p /block/$argdev|cut -c 29-30`
+newdev=`echo $((0x$reqdev+93)) | awk '{printf "%c\n", $1}'`
+echo sd${newdev}$2
