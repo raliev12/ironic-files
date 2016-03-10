@@ -72,7 +72,8 @@ boot_new_node () {
 	
 	echo "Creating image..."
 	glance image-create --name $image_name --disk-format qcow2 --container-format bare --is-public true --file /tmp/$LAST_BUILD  --progress
-	
+	rm /tmp/$LAST_BUILD	
+
 	echo "Creating node..."
 	local net_id=$(neutron net-list | grep -w net04 | awk '{print $2;}')
 	nova boot --image $image_name --flavor $FLAVOR_NAME --nic net-id=$net_id $node_name
