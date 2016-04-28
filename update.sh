@@ -20,8 +20,8 @@ NODE_IP=""
 
 get_new_image() {
 	echo "Downloading last image..."
-	local url='http://172.18.160.121:8000/'
-	LAST_BUILD=`curl $url 2>&1 | grep -o -E 'href="([^"#]+)"' | cut -d'"' -f2 | tail -2 | head -1`
+	local url='ftp://172.18.160.121/'
+	LAST_BUILD=$(curl $url 2>/dev/null | tail -1 | awk '{print $(NF)}')
 	if [ -z "$LAST_BUILD" ]; then
 		echo "Error - last build file invalid"
 		exit 1
